@@ -1,0 +1,24 @@
+spring:
+  datasource:
+    url: jdbc:h2:mem:keystone_test;MODE=PostgreSQL;DB_CLOSE_DELAY=-1
+    username: sa
+    password:
+    driver-class-name: org.h2.Driver
+  jpa:
+    hibernate:
+      ddl-auto: none
+  flyway:
+    enabled: true
+  sql:
+    init:
+      mode: never
+
+app:
+  jwt:
+    secret: keystone-test-secret-that-is-long-enough-0123456789
+    expiration-ms: 86400000
+  cors:
+    allowed-origins: http://localhost:5174,http://localhost:5173
+  sla:
+    scheduler:
+      enabled: false
