@@ -30,9 +30,6 @@ pool.query('SELECT $1::text as greeting', ['Hello World']).then(res => {
   process.exit(1);
 });
 
-// In-memory refresh token store (for production, use Redis)
-const refreshTokens = {};
-
 // ============ AUTH ROUTES ============
 
 // Register
@@ -51,7 +48,7 @@ app.post('/api/auth/register', async (req, res) => {
     }
     
     const hashedPassword = await bcrypt.hash(password, 10);
-    const enabled = role !== 'CUSTOMER'; // Customers enabled by default via signup flow
+    const enabled = role !== 'CUSTOMER';
     
     const createdAt = new Date();
     const updatedAt = new Date();
@@ -189,7 +186,7 @@ app.post('/api/auth/refresh', (req, res) => {
     refreshTokens[newRefreshToken] = user.id;
     
     res.json({ accessToken: newAccessToken, refreshToken: newRefreshToken });
-  });
+  }
 });
 
 // Logout
@@ -202,38 +199,32 @@ app.post('/api/auth/logout', (req, res) => {
 });
 
 // Get current user
-app.get('/api/auth/me', async (req, res) => {
+app.get('/api/auth/me', (req, res) => {
   try {
-    // In a real app, we'd verify the JWT from the Authorization header
-    // For this demo, we'll check if there's a session
     const authHeader = req.headers['authorization'];
-    let user = null;
-    
     if (authHeader && authHeader.startsWith('Bearer ')) {
       const token = authHeader.split(' ')[1];
       jwt.verify(token, process.env.ACCESS_TOKEN_SECRET, (err, decoded) => {
         if (err) return res.status(401).json({ message: 'Invalid token' });
-        user = {
-          id: decoded.id,
-          username: decoded.username,
-          firstName: decoded.firstName || '',
-          lastName: decoded.lastName || '',
-          email: decoded.email || '',
-          phone: decoded.phone || '',
-          role: decoded.role,
-        };
-        res.json({ user });
+        res.json({
+          user: {
+            id: decoded.id,
+            username: decoded.username,
+            firstName: decoded.firstName || '',
+            lastName: decoded.lastName || '',
+            email: decoded.email || '',
+            phone: decoded.phone || '',
+            role: decoded.role,
+          }
+        });
       });
-    }
-    
-    if (!user) {
-      // Try refresh token approach for demo
+    } else {
       res.status(401).json({ message: 'Authentication required' });
     }
   } catch (err) {
     res.status(500).json({ message: 'Internal server error' });
   }
-});
+}
 
 // ============ WORK ORDER ROUTES ============
 
@@ -367,7 +358,7 @@ app.post('/api/work-orders', async (req, res) => {
     await pool.query(
       `INSERT INTO notifications (user_id, title, message, type, is_read, created_at)
        VALUES ($1, 'New work order', 'WO-${seqResult.rows[0].next_val} has been created', 'INFO', FALSE, NOW())`,
-      [1] // In production, this would be the dispatcher/manager ID
+      [1]
     );
     
     res.status(201).json(result.rows[0]);
@@ -410,10 +401,6 @@ app.patch('/api/work-orders/:id/status', async (req, res) => {
     
     // Create notification
     const technician = woResult.rows[0].assigned_technician_id;
-    const techName = technician ? await pool.query('SELECT first_name, last_name FROM users WHERE id = $1', [technician]) : null;
-    
-    let notifyMessage = '';
-    let notifyType = 'INFO';
     
     const statusMap = {
       'NEW': 'Work order created',
@@ -424,10 +411,10 @@ app.patch('/api/work-orders/:id/status', async (req, res) => {
       'CLOSED': 'Work order closed'
     };
     
+    let notifyMessage = '';
+    let notifyType = 'INFO';
+    
     notifyMessage = statusMap[toStatus] || 'Status changed';
-    if (technician) {
-      notifyMessage = `You ${statusMap[toStatus] || 'status changed'} for work order WO-${id}`;
-    }
     
     await pool.query(
       `INSERT INTO notifications (user_id, title, message, type, is_read, created_at)
@@ -601,8 +588,8 @@ app.get('/api/parts', async (req, res) => {
     }
     if (lowStock) {
       paramCount++;
-      query += ` AND low_stock = $${paramCount}`;
-      params.push(lowStock === 'true');
+      query += ` AND quantity_on_hand <= reorder_level`;
+      params.push(true);
     }
     
     const countResult = await pool.query(`SELECT COUNT(*) as total FROM (${query}) as subquery`, params);
@@ -637,14 +624,11 @@ app.get('/api/parts', async (req, res) => {
 // Dashboard metrics
 app.get('/api/dashboard/metrics', async (req, res) => {
   try {
-    // Get counts from database
     const woCount = await pool.query('SELECT COUNT(*) as count FROM work_orders');
-    const woStatusCounts = await pool.query(
-      `SELECT status, COUNT(*) as count FROM work_orders GROUP BY status`
-    );
+    const woStatusCounts = await pool.query(`SELECT status, COUNT(*) as count FROM work_orders GROUP BY status`);
     const partsLow = await pool.query(`SELECT COUNT(*) as count FROM parts WHERE quantity_on_hand <= reorder_level`);
-    const users = await pool.query('SELECT COUNT(*) as count FROM users WHERE role = $1', ['TECHNICIAN']);
-    const customers = await pool.query('SELECT COUNT(*) as count FROM users WHERE role = $1', ['CUSTOMER']);
+    const users = await pool.query(`SELECT COUNT(*) as count FROM users WHERE role = 'TECHNICIAN'`);
+    const customers = await pool.query(`SELECT COUNT(*) as count FROM users WHERE role = 'CUSTOMER'`);
     
     const metrics = {
       totalWorkOrders: parseInt(woCount.rows[0].count),
@@ -672,7 +656,6 @@ app.get('/api/dashboard/metrics', async (req, res) => {
       completedLast30Days: 0,
     };
     
-    // Calculate status counts
     woStatusCounts.rows.forEach(row => {
       const status = row.status;
       metrics.byStatus[status] = parseInt(row.count);
@@ -687,13 +670,11 @@ app.get('/api/dashboard/metrics', async (req, res) => {
       if (status === 'LOW') metrics.openLow += parseInt(row.count);
     });
     
-    // Low stock parts (estimate: 30% of low stock parts trigger alerts)
     metrics.lowStockAlerts = Math.floor(metrics.lowStockParts * 0.3);
     
     res.json(metrics);
   } catch (err) {
     console.error('Get dashboard metrics error:', err.message);
-    // Return default metrics on error
     res.json({
       totalWorkOrders: 0,
       byStatus: {},
@@ -790,25 +771,18 @@ app.patch('/api/notifications/read-all', async (req, res) => {
 
 // ============ SCHEDULE/HEALTH ============
 
-// Health check
-app.get('/actuator/health', (req, res) => {
-  res.json({ status: 'UP', timestamp: new Date().toISOString() });
-});
-
-// Simple health endpoint
+// Health check - Vercel serverless needs this export
 app.get('/health', (req, res) => {
   res.json({ status: 'OK' });
 });
 
-// Start server
-app.listen(PORT, () => {
-  console.log(`Keystone API running on port ${PORT}`);
-  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
-});
+// Start server (for local development - Vercel serverless will use module.exports)
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`Keystone API running on port ${PORT}`);
+    console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+  });
+}
 
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  console.log('SIGTERM received. Shutting down gracefully...');
-  pool.end();
-  process.exit(0);
-});
+// For Vercel serverless deployment: export the app
+module.exports = app;
