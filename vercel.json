@@ -1,0 +1,10 @@
+{
+  "version": 2,
+  "comment": "Root-level Vercel config — deploys the frontend only. The backend runs separately on Railway/Render.",
+  "buildCommand": "cd frontend && npm install && npm run build",
+  "outputDirectory": "frontend/dist",
+  "framework": "vite",
+  "rewrites": [
+    { "source": "/((?!assets/).*)", "destination": "/index.html" }
+  ]
+}

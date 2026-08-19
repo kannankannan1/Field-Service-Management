@@ -3,98 +3,119 @@ const cors = require('cors');
 const helmet = require('helmet');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
-const { Pool } = require('pg');
+const { createClient } = require('@supabase/supabase-js');
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// Middleware
+// ── Supabase admin client (uses service role key — server-side only) ──
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY,
+  { auth: { autoRefreshToken: false, persistSession: false } }
+);
+
+const CORS_ALLOWED = (process.env.CORS_ORIGIN || '')
+  .split(',')
+  .map((o) => o.trim())
+  .filter(Boolean);
+
+const ACCESS_TOKEN_SECRET  = process.env.ACCESS_TOKEN_SECRET  || 'dev-access-secret';
+const REFRESH_TOKEN_SECRET = process.env.REFRESH_TOKEN_SECRET || 'dev-refresh-secret';
+
+// ── Middleware ──
 app.use(helmet());
-app.use(cors({
-  origin: process.env.CORS_ORIGIN || 'http://localhost:5173',
-  credentials: true,
-}));
+app.use(cors({ origin: CORS_ALLOWED.length ? CORS_ALLOWED : true, credentials: true }));
 app.use(express.json());
 
-// PostgreSQL connection
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-});
+// ── In-memory refresh token store (swap for Redis in production) ──
+const refreshTokens = {};
 
-// Test database connection
-pool.query('SELECT $1::text as greeting', ['Hello World']).then(res => {
-  console.log('Database connected:', res.rows[0].greeting);
-}).catch(err => {
-  console.error('Database connection error:', err.message);
-  process.exit(1);
-});
+// ── Helpers ──
+function makeAccessToken(user) {
+  return jwt.sign(
+    { id: user.id, username: user.username, role: user.role },
+    ACCESS_TOKEN_SECRET,
+    { expiresIn: '15m' }
+  );
+}
+function makeRefreshToken(user) {
+  const token = jwt.sign({ id: user.id, username: user.username }, REFRESH_TOKEN_SECRET);
+  refreshTokens[token] = user.id;
+  return token;
+}
+function currentUserId(req) {
+  const auth = req.headers['authorization'];
+  if (!auth?.startsWith('Bearer ')) return null;
+  try {
+    return jwt.verify(auth.split(' ')[1], ACCESS_TOKEN_SECRET).id;
+  } catch { return null; }
+}
+function toUser(row) {
+  return {
+    id:        row.id,
+    username:  row.username,
+    firstName: row.first_name,
+    lastName:  row.last_name,
+    email:     row.email,
+    phone:     row.phone,
+    role:      row.role,
+    enabled:   row.enabled,
+  };
+}
+function toNotification(row) {
+  return {
+    id:        row.id,
+    title:     row.title,
+    message:   row.message,
+    type:      row.type,
+    read:      !!row.is_read,
+    createdAt: row.created_at,
+  };
+}
+function paginate(query, page, size) {
+  const p    = Math.max(parseInt(page)  || 1, 1);
+  const s    = Math.max(parseInt(size)  || 20, 1);
+  const from = (p - 1) * s;
+  const to   = from + s - 1;
+  return { query: query.range(from, to), page: p, size: s, from };
+}
 
-// ============ AUTH ROUTES ============
+// ══════════════════════════════════════════
+//  AUTH
+// ══════════════════════════════════════════
 
 // Register
 app.post('/api/auth/register', async (req, res) => {
   try {
     const { username, password, firstName, lastName, email, phone, role } = req.body;
-    
-    if (!username || !password || !role) {
+    if (!username || !password || !role)
       return res.status(400).json({ message: 'Missing required fields' });
-    }
-    
-    // Check if user exists
-    const userCheck = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
-    if (userCheck.rows.length > 0) {
-      return res.status(409).json({ message: 'Username already exists' });
-    }
-    
-    const hashedPassword = await bcrypt.hash(password, 10);
+
+    const { data: existing } = await supabase
+      .from('users').select('id').eq('username', username).maybeSingle();
+    if (existing) return res.status(409).json({ message: 'Username already exists' });
+
+    const hashed  = await bcrypt.hash(password, 10);
     const enabled = role !== 'CUSTOMER';
-    
-    const createdAt = new Date();
-    const updatedAt = new Date();
-    
-    const result = await pool.query(
-      `INSERT INTO users (username, password, first_name, last_name, email, phone, role, enabled, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-       RETURNING id, username, first_name, last_name, email, phone, role, enabled, created_at, updated_at`,
-      [username, hashedPassword, firstName || '', lastName || '', email || '', phone || '', role, enabled, createdAt, updatedAt]
-    );
-    
-    const user = result.rows[0];
-    
-    // Create JWT token
-    const accessToken = jwt.sign(
-      { id: user.id, username: user.username, role: user.role },
-      process.env.ACCESS_TOKEN_SECRET,
-      { expiresIn: '15m' }
-    );
-    
-    const refreshToken = jwt.sign(
-      { id: user.id, username: user.username },
-      process.env.REFRESH_TOKEN_SECRET
-    );
-    refreshTokens[refreshToken] = user.id;
-    
-    await pool.query(
-      `INSERT INTO notifications (user_id, title, message, type, is_read, created_at)
-       VALUES ($1, 'New account', 'Welcome to Keystone Field Service', 'INFO', FALSE, NOW())`,
-      [user.id]
-    );
-    
-    res.json({
-      accessToken,
-      refreshToken,
-      user: {
-        id: user.id,
-        username: user.username,
-        firstName: user.first_name,
-        lastName: user.last_name,
-        email: user.email,
-        phone: user.phone,
-        role: user.role,
-        enabled: user.enabled,
-      }
+    const now     = new Date().toISOString();
+
+    const { data: user, error } = await supabase
+      .from('users')
+      .insert({ username, password: hashed, first_name: firstName || '', last_name: lastName || '',
+                email: email || '', phone: phone || '', role, enabled, created_at: now, updated_at: now })
+      .select()
+      .single();
+    if (error) throw error;
+
+    // welcome notification
+    await supabase.from('notifications').insert({
+      user_id: user.id, title: 'Welcome', message: 'Welcome to Keystone Field Service',
+      type: 'INFO', is_read: false, created_at: now,
     });
+
+    res.json({ accessToken: makeAccessToken(user), refreshToken: makeRefreshToken(user), user: toUser(user) });
   } catch (err) {
     console.error('Register error:', err.message);
     res.status(500).json({ message: 'Internal server error' });
@@ -105,201 +126,91 @@ app.post('/api/auth/register', async (req, res) => {
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { username, password } = req.body;
-    
-    if (!username || !password) {
+    if (!username || !password)
       return res.status(400).json({ message: 'Missing username or password' });
-    }
-    
-    const userCheck = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
-    if (userCheck.rows.length === 0) {
-      return res.status(401).json({ message: 'Invalid username or password' });
-    }
-    
-    const user = userCheck.rows[0];
-    const validPassword = await bcrypt.compare(password, user.password);
-    
-    if (!validPassword) {
-      return res.status(401).json({ message: 'Invalid username or password' });
-    }
-    
-    if (!user.enabled) {
-      return res.status(401).json({ message: 'Account disabled' });
-    }
-    
-    const accessToken = jwt.sign(
-      { id: user.id, username: user.username, role: user.role },
-      process.env.ACCESS_TOKEN_SECRET,
-      { expiresIn: '15m' }
-    );
-    
-    const refreshToken = jwt.sign(
-      { id: user.id, username: user.username },
-      process.env.REFRESH_TOKEN_SECRET
-    );
-    refreshTokens[refreshToken] = user.id;
-    
-    res.json({
-      accessToken,
-      refreshToken,
-      user: {
-        id: user.id,
-        username: user.username,
-        firstName: user.first_name,
-        lastName: user.last_name,
-        email: user.email,
-        phone: user.phone,
-        role: user.role,
-        enabled: user.enabled,
-      }
-    });
+
+    const { data: user, error } = await supabase
+      .from('users').select('*').eq('username', username).maybeSingle();
+    if (error || !user) return res.status(401).json({ message: 'Invalid username or password' });
+    if (!user.enabled)  return res.status(401).json({ message: 'Account disabled' });
+
+    const valid = await bcrypt.compare(password, user.password);
+    if (!valid) return res.status(401).json({ message: 'Invalid username or password' });
+
+    res.json({ accessToken: makeAccessToken(user), refreshToken: makeRefreshToken(user), user: toUser(user) });
   } catch (err) {
     console.error('Login error:', err.message);
     res.status(500).json({ message: 'Internal server error' });
   }
 });
 
-// Refresh token
+// Refresh
 app.post('/api/auth/refresh', (req, res) => {
   const { token } = req.body;
-  
-  if (!token || !refreshTokens[token]) {
+  if (!token || !refreshTokens[token])
     return res.status(403).json({ message: 'Invalid refresh token' });
-  }
-  
-  jwt.verify(token, process.env.REFRESH_TOKEN_SECRET, (err, user) => {
-    if (err) {
-      return res.status(403).json({ message: 'Invalid refresh token' });
-    }
-    
+
+  jwt.verify(token, REFRESH_TOKEN_SECRET, (err, user) => {
+    if (err) return res.status(403).json({ message: 'Invalid refresh token' });
     delete refreshTokens[token];
-    
-    const newAccessToken = jwt.sign(
-      { id: user.id, username: user.username, role: user.role },
-      process.env.ACCESS_TOKEN_SECRET,
-      { expiresIn: '15m' }
-    );
-    
-    const newRefreshToken = jwt.sign(
-      { id: user.id, username: user.username },
-      process.env.REFRESH_TOKEN_SECRET
-    );
-    refreshTokens[newRefreshToken] = user.id;
-    
-    res.json({ accessToken: newAccessToken, refreshToken: newRefreshToken });
-  }
+    res.json({ accessToken: makeAccessToken(user), refreshToken: makeRefreshToken(user) });
+  });
 });
 
 // Logout
 app.post('/api/auth/logout', (req, res) => {
   const { token } = req.body;
-  if (token) {
-    delete refreshTokens[token];
-  }
+  if (token) delete refreshTokens[token];
   res.json({ message: 'Logged out successfully' });
 });
 
-// Get current user
+// Me
 app.get('/api/auth/me', (req, res) => {
-  try {
-    const authHeader = req.headers['authorization'];
-    if (authHeader && authHeader.startsWith('Bearer ')) {
-      const token = authHeader.split(' ')[1];
-      jwt.verify(token, process.env.ACCESS_TOKEN_SECRET, (err, decoded) => {
-        if (err) return res.status(401).json({ message: 'Invalid token' });
-        res.json({
-          user: {
-            id: decoded.id,
-            username: decoded.username,
-            firstName: decoded.firstName || '',
-            lastName: decoded.lastName || '',
-            email: decoded.email || '',
-            phone: decoded.phone || '',
-            role: decoded.role,
-          }
-        });
-      });
-    } else {
-      res.status(401).json({ message: 'Authentication required' });
-    }
-  } catch (err) {
-    res.status(500).json({ message: 'Internal server error' });
-  }
-}
+  const auth = req.headers['authorization'];
+  if (!auth?.startsWith('Bearer '))
+    return res.status(401).json({ message: 'Authentication required' });
+  jwt.verify(auth.split(' ')[1], ACCESS_TOKEN_SECRET, (err, decoded) => {
+    if (err) return res.status(401).json({ message: 'Invalid token' });
+    res.json({ user: decoded });
+  });
+});
 
-// ============ WORK ORDER ROUTES ============
+// ══════════════════════════════════════════
+//  WORK ORDERS
+// ══════════════════════════════════════════
 
-// List work orders
 app.get('/api/work-orders', async (req, res) => {
   try {
-    const { search, status, priority, customerId, siteId, technicianId, slaBreached, page = 1, size = 20, sort } = req.query;
-    
-    let query = `SELECT wo.*, c.name as customerName, s.name as siteName 
-                 FROM work_orders wo 
-                 JOIN customers c ON wo.customer_id = c.id 
-                 JOIN sites s ON wo.site_id = s.id 
-                 WHERE 1=1`;
-    const params = [];
-    let paramCount = 0;
-    
-    if (search) {
-      paramCount++;
-      query += ` AND (wo.title ILIKE $${paramCount} OR wo.description ILIKE $${paramCount} OR wo.work_order_number ILIKE $${paramCount})`;
-      params.push(`%${search}%`);
-    }
-    if (status) {
-      paramCount++;
-      query += ` AND wo.status = $${paramCount}`;
-      params.push(status);
-    }
-    if (priority) {
-      paramCount++;
-      query += ` AND wo.priority = $${paramCount}`;
-      params.push(priority);
-    }
-    if (customerId) {
-      paramCount++;
-      query += ` AND wo.customer_id = $${paramCount}`;
-      params.push(customerId);
-    }
-    if (siteId) {
-      paramCount++;
-      query += ` AND wo.site_id = $${paramCount}`;
-      params.push(siteId);
-    }
-    if (technicianId) {
-      paramCount++;
-      query += ` AND wo.assigned_technician_id = $${paramCount}`;
-      params.push(technicianId);
-    }
-    if (slaBreached !== undefined) {
-      paramCount++;
-      query += ` AND wo.sla_breached = $${paramCount}`;
-      params.push(slaBreached === 'true');
-    }
-    
-    // Count total
-    const countQuery = `SELECT COUNT(*) as total FROM (${query}) as subquery`;
-    const countResult = await pool.query(countQuery, params);
-    const total = parseInt(countResult.rows[0].total);
-    
-    // Add pagination and sorting
-    const pageNum = parseInt(page);
-    const pageSize = parseInt(size);
-    const offset = (pageNum - 1) * pageSize;
-    
-    query += ` ORDER BY wo.${sort || 'created_at'} DESC LIMIT $${++paramCount} OFFSET $${++paramCount}`;
-    params.push(pageSize, offset);
-    
-    const result = await pool.query(query, params);
-    
+    const { search, status, priority, customerId, siteId, technicianId,
+            slaBreached, page = 1, size = 20 } = req.query;
+
+    let q = supabase
+      .from('work_orders')
+      .select(`*, customers(name), sites(name)`, { count: 'exact' });
+
+    if (search)       q = q.or(`title.ilike.%${search}%,description.ilike.%${search}%,work_order_number.ilike.%${search}%`);
+    if (status)       q = q.eq('status', status);
+    if (priority)     q = q.eq('priority', priority);
+    if (customerId)   q = q.eq('customer_id', customerId);
+    if (siteId)       q = q.eq('site_id', siteId);
+    if (technicianId) q = q.eq('assigned_technician_id', technicianId);
+    if (slaBreached !== undefined) q = q.eq('sla_breached', slaBreached === 'true');
+
+    q = q.order('created_at', { ascending: false });
+
+    const p    = Math.max(parseInt(page) || 1, 1);
+    const s    = Math.max(parseInt(size) || 20, 1);
+    const from = (p - 1) * s;
+
+    const { data, error, count } = await q.range(from, from + s - 1);
+    if (error) throw error;
+
+    const total = count || 0;
     res.json({
-      content: result.rows,
-      page: pageNum,
-      size: pageSize,
-      totalElements: total,
-      totalPages: Math.ceil(total / pageSize),
-      first: pageNum === 1,
-      last: pageNum * pageSize >= total,
+      content:       data.map(r => ({ ...r, customerName: r.customers?.name, siteName: r.sites?.name })),
+      page: p, size: s, totalElements: total,
+      totalPages: Math.ceil(total / s),
+      first: p === 1, last: p * s >= total,
     });
   } catch (err) {
     console.error('Get work orders error:', err.message);
@@ -307,165 +218,125 @@ app.get('/api/work-orders', async (req, res) => {
   }
 });
 
-// Get work order by ID
 app.get('/api/work-orders/:id', async (req, res) => {
   try {
-    const { id } = req.params;
-    const result = await pool.query(
-      `SELECT wo.*, c.name as customerName, s.name as siteName, 
-       u.first_name as technicianFirstName, u.last_name as technicianLastName
-       FROM work_orders wo 
-       JOIN customers c ON wo.customer_id = c.id 
-       JOIN sites s ON wo.site_id = s.id 
-       LEFT JOIN users u ON wo.assigned_technician_id = u.id
-       WHERE wo.id = $1`,
-      [id]
-    );
-    
-    if (result.rows.length === 0) {
-      return res.status(404).json({ message: 'Work order not found' });
-    }
-    
-    res.json(result.rows[0]);
+    const { data, error } = await supabase
+      .from('work_orders')
+      .select(`*, customers(name), sites(name), users!assigned_technician_id(first_name, last_name)`)
+      .eq('id', req.params.id)
+      .maybeSingle();
+    if (error) throw error;
+    if (!data)  return res.status(404).json({ message: 'Work order not found' });
+
+    res.json({
+      ...data,
+      customerName:        data.customers?.name,
+      siteName:            data.sites?.name,
+      technicianFirstName: data.users?.first_name,
+      technicianLastName:  data.users?.last_name,
+    });
   } catch (err) {
     console.error('Get work order error:', err.message);
     res.status(500).json({ message: 'Internal server error' });
   }
 });
 
-// Create work order
 app.post('/api/work-orders', async (req, res) => {
   try {
-    const { customerId, siteId, title, description, priority, scheduledStart, scheduledEnd } = req.body;
-    
-    if (!customerId || !siteId || !title) {
+    const { customerId, siteId, title, description, priority } = req.body;
+    if (!customerId || !siteId || !title)
       return res.status(400).json({ message: 'Missing required fields: customerId, siteId, title' });
-    }
-    
-    // Get next work order number
-    const seqResult = await pool.query('SELECT NEXT VALUE FOR work_order_number_seq as next_val');
-    const workOrderNumber = `WO-${String(seqResult.rows[0].next_val).padStart(6, '0')}`;
-    
-    const createdAt = new Date();
-    const result = await pool.query(
-      `INSERT INTO work_orders (work_order_number, customer_id, site_id, title, description, priority, status, created_by_id, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, 'NEW', $7, $8, $9)
-       RETURNING *`,
-      [workOrderNumber, customerId, siteId, title, description || '', priority || 'MEDIUM', 1, createdAt, createdAt]
-    );
-    
-    // Create notification
-    await pool.query(
-      `INSERT INTO notifications (user_id, title, message, type, is_read, created_at)
-       VALUES ($1, 'New work order', 'WO-${seqResult.rows[0].next_val} has been created', 'INFO', FALSE, NOW())`,
-      [1]
-    );
-    
-    res.status(201).json(result.rows[0]);
+
+    // Generate unique work order number using current timestamp + random
+    const num = `WO-${Date.now().toString().slice(-6)}${Math.floor(Math.random() * 100).toString().padStart(2, '0')}`;
+    const now = new Date().toISOString();
+    const userId = currentUserId(req) || 1;
+
+    const { data, error } = await supabase
+      .from('work_orders')
+      .insert({
+        work_order_number: num, customer_id: customerId, site_id: siteId,
+        title, description: description || '', priority: priority || 'MEDIUM',
+        status: 'NEW', created_by_id: userId, created_at: now, updated_at: now,
+      })
+      .select()
+      .single();
+    if (error) throw error;
+
+    await supabase.from('notifications').insert({
+      user_id: userId, title: 'New work order',
+      message: `${num} has been created`, type: 'INFO', is_read: false, created_at: now,
+    });
+
+    res.status(201).json(data);
   } catch (err) {
     console.error('Create work order error:', err.message);
     res.status(500).json({ message: 'Internal server error' });
   }
 });
 
-// Update work order status
 app.patch('/api/work-orders/:id/status', async (req, res) => {
   try {
     const { id } = req.params;
     const { toStatus, note } = req.body;
-    
-    if (!toStatus) {
-      return res.status(400).json({ message: 'Missing required field: toStatus' });
-    }
-    
-    // Get the work order with current user info
-    const woResult = await pool.query('SELECT * FROM work_orders WHERE id = $1', [id]);
-    if (woResult.rows.length === 0) {
-      return res.status(404).json({ message: 'Work order not found' });
-    }
-    
-    const fromStatus = woResult.rows[0].status;
-    
-    // Update status
-    const updateResult = await pool.query(
-      `UPDATE work_orders SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING *`,
-      [toStatus, id]
-    );
-    
-    // Create status history entry
-    await pool.query(
-      `INSERT INTO work_order_status_history (work_order_id, from_status, to_status, changed_by_id, changed_at, note)
-       VALUES ($1, $2, $3, $4, NOW(), $5)`,
-      [id, fromStatus, toStatus, 1, note || '']
-    );
-    
-    // Create notification
-    const technician = woResult.rows[0].assigned_technician_id;
-    
-    const statusMap = {
-      'NEW': 'Work order created',
-      'ASSIGNED': 'Work order assigned',
-      'IN_PROGRESS': 'Work started',
-      'ON_HOLD': 'Work on hold',
-      'COMPLETED': 'Job completed',
-      'CLOSED': 'Work order closed'
-    };
-    
-    let notifyMessage = '';
-    let notifyType = 'INFO';
-    
-    notifyMessage = statusMap[toStatus] || 'Status changed';
-    
-    await pool.query(
-      `INSERT INTO notifications (user_id, title, message, type, is_read, created_at)
-       VALUES ($1, 'Work order status changed', $2, $3, FALSE, NOW())`,
-      [technician || 1, notifyMessage, notifyType]
-    );
-    
-    res.json(updateResult.rows[0]);
+    if (!toStatus) return res.status(400).json({ message: 'Missing required field: toStatus' });
+
+    const { data: wo, error: fetchErr } = await supabase
+      .from('work_orders').select('status, assigned_technician_id').eq('id', id).maybeSingle();
+    if (fetchErr) throw fetchErr;
+    if (!wo) return res.status(404).json({ message: 'Work order not found' });
+
+    const userId = currentUserId(req) || 1;
+    const now    = new Date().toISOString();
+
+    const { data: updated, error: updateErr } = await supabase
+      .from('work_orders')
+      .update({ status: toStatus, updated_at: now })
+      .eq('id', id)
+      .select()
+      .single();
+    if (updateErr) throw updateErr;
+
+    await supabase.from('work_order_status_history').insert({
+      work_order_id: id, from_status: wo.status, to_status: toStatus,
+      changed_by_id: userId, changed_at: now, note: note || '',
+    });
+
+    const notifyUserId = wo.assigned_technician_id || userId;
+    await supabase.from('notifications').insert({
+      user_id: notifyUserId, title: 'Work order status changed',
+      message: `Status changed to ${toStatus}`, type: 'INFO', is_read: false, created_at: now,
+    });
+
+    res.json(updated);
   } catch (err) {
     console.error('Update work order status error:', err.message);
     res.status(500).json({ message: 'Internal server error' });
   }
 });
 
-// ============ CUSTOMER ROUTES ============
+// ══════════════════════════════════════════
+//  CUSTOMERS
+// ══════════════════════════════════════════
 
-// List customers
 app.get('/api/customers', async (req, res) => {
   try {
     const { search, page = 1, size = 20 } = req.query;
-    
-    let query = `SELECT * FROM customers WHERE 1=1`;
-    const params = [];
-    let paramCount = 0;
-    
-    if (search) {
-      paramCount++;
-      query += ` AND (name ILIKE $${paramCount} OR contact_name ILIKE $${paramCount} OR email ILIKE $${paramCount})`;
-      params.push(`%${search}%`);
-    }
-    
-    const countResult = await pool.query(`SELECT COUNT(*) as total FROM (${query}) as subquery`, params);
-    const total = parseInt(countResult.rows[0].total);
-    
-    const pageNum = parseInt(page);
-    const pageSize = parseInt(size);
-    const offset = (pageNum - 1) * pageSize;
-    
-    query += ` ORDER BY name LIMIT $${++paramCount} OFFSET $${++paramCount}`;
-    params.push(pageSize, offset);
-    
-    const result = await pool.query(query, params);
-    
+
+    let q = supabase.from('customers').select('*', { count: 'exact' });
+    if (search) q = q.or(`name.ilike.%${search}%,contact_name.ilike.%${search}%,email.ilike.%${search}%`);
+    q = q.order('name');
+
+    const p    = Math.max(parseInt(page) || 1, 1);
+    const s    = Math.max(parseInt(size) || 20, 1);
+    const from = (p - 1) * s;
+    const { data, error, count } = await q.range(from, from + s - 1);
+    if (error) throw error;
+
+    const total = count || 0;
     res.json({
-      content: result.rows,
-      page: pageNum,
-      size: pageSize,
-      totalElements: total,
-      totalPages: Math.ceil(total / pageSize),
-      first: pageNum === 1,
-      last: pageNum * pageSize >= total,
+      content: data, page: p, size: s, totalElements: total,
+      totalPages: Math.ceil(total / s), first: p === 1, last: p * s >= total,
     });
   } catch (err) {
     console.error('Get customers error:', err.message);
@@ -473,72 +344,50 @@ app.get('/api/customers', async (req, res) => {
   }
 });
 
-// Create customer
 app.post('/api/customers', async (req, res) => {
   try {
     const { name, contactName, email, phone, address } = req.body;
-    
-    if (!name) {
-      return res.status(400).json({ message: 'Name is required' });
-    }
-    
-    const createdAt = new Date();
-    const result = await pool.query(
-      `INSERT INTO customers (name, contact_name, email, phone, address, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-       RETURNING *`,
-      [name, contactName || '', email || '', phone || '', address || '', createdAt, createdAt]
-    );
-    
-    res.status(201).json(result.rows[0]);
+    if (!name) return res.status(400).json({ message: 'Name is required' });
+
+    const now = new Date().toISOString();
+    const { data, error } = await supabase
+      .from('customers')
+      .insert({ name, contact_name: contactName || '', email: email || '',
+                phone: phone || '', address: address || '', created_at: now, updated_at: now })
+      .select().single();
+    if (error) throw error;
+
+    res.status(201).json(data);
   } catch (err) {
     console.error('Create customer error:', err.message);
     res.status(500).json({ message: 'Internal server error' });
   }
 });
 
-// ============ SITE ROUTES ============
+// ══════════════════════════════════════════
+//  SITES
+// ══════════════════════════════════════════
 
-// List sites
 app.get('/api/sites', async (req, res) => {
   try {
     const { customerId, search, page = 1, size = 20 } = req.query;
-    
-    let query = `SELECT s.*, c.name as customerName FROM sites s JOIN customers c ON s.customer_id = c.id WHERE 1=1`;
-    const params = [];
-    let paramCount = 0;
-    
-    if (customerId) {
-      paramCount++;
-      query += ` AND s.customer_id = $${paramCount}`;
-      params.push(customerId);
-    }
-    if (search) {
-      paramCount++;
-      query += ` AND (s.name ILIKE $${paramCount} OR s.street_address ILIKE $${paramCount})`;
-      params.push(`%${search}%`);
-    }
-    
-    const countResult = await pool.query(`SELECT COUNT(*) as total FROM (${query}) as subquery`, params);
-    const total = parseInt(countResult.rows[0].total);
-    
-    const pageNum = parseInt(page);
-    const pageSize = parseInt(size);
-    const offset = (pageNum - 1) * pageSize;
-    
-    query += ` ORDER BY s.name LIMIT $${++paramCount} OFFSET $${++paramCount}`;
-    params.push(pageSize, offset);
-    
-    const result = await pool.query(query, params);
-    
+
+    let q = supabase.from('sites').select('*, customers(name)', { count: 'exact' });
+    if (customerId) q = q.eq('customer_id', customerId);
+    if (search)     q = q.or(`name.ilike.%${search}%,street_address.ilike.%${search}%`);
+    q = q.order('name');
+
+    const p    = Math.max(parseInt(page) || 1, 1);
+    const s    = Math.max(parseInt(size) || 20, 1);
+    const from = (p - 1) * s;
+    const { data, error, count } = await q.range(from, from + s - 1);
+    if (error) throw error;
+
+    const total = count || 0;
     res.json({
-      content: result.rows,
-      page: pageNum,
-      size: pageSize,
-      totalElements: total,
-      totalPages: Math.ceil(total / pageSize),
-      first: pageNum === 1,
-      last: pageNum * pageSize >= total,
+      content: data.map(r => ({ ...r, customerName: r.customers?.name })),
+      page: p, size: s, totalElements: total,
+      totalPages: Math.ceil(total / s), first: p === 1, last: p * s >= total,
     });
   } catch (err) {
     console.error('Get sites error:', err.message);
@@ -546,72 +395,53 @@ app.get('/api/sites', async (req, res) => {
   }
 });
 
-// Create site
 app.post('/api/sites', async (req, res) => {
   try {
-    const { customerId, name, streetAddress, city, state, zip, country, contactName, contactPhone, notes } = req.body;
-    
-    if (!customerId || !name) {
+    const { customerId, name, streetAddress, city, state, zip, country,
+            contactName, contactPhone, notes } = req.body;
+    if (!customerId || !name)
       return res.status(400).json({ message: 'customerId and name are required' });
-    }
-    
-    const createdAt = new Date();
-    const result = await pool.query(
-      `INSERT INTO sites (customer_id, name, street_address, city, state, zip, country, contact_name, contact_phone, notes, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-       RETURNING *`,
-      [customerId, name, streetAddress || '', city || '', state || '', zip || '', country || '', contactName || '', notes || '', createdAt, createdAt]
-    );
-    
-    res.status(201).json(result.rows[0]);
+
+    const now = new Date().toISOString();
+    const { data, error } = await supabase
+      .from('sites')
+      .insert({ customer_id: customerId, name, street_address: streetAddress || '',
+                city: city || '', state: state || '', zip: zip || '', country: country || '',
+                contact_name: contactName || '', contact_phone: contactPhone || '',
+                notes: notes || '', created_at: now, updated_at: now })
+      .select().single();
+    if (error) throw error;
+
+    res.status(201).json(data);
   } catch (err) {
     console.error('Create site error:', err.message);
     res.status(500).json({ message: 'Internal server error' });
   }
 });
 
-// ============ PART ROUTES ============
+// ══════════════════════════════════════════
+//  PARTS
+// ══════════════════════════════════════════
 
-// List parts
 app.get('/api/parts', async (req, res) => {
   try {
     const { search, lowStock, page = 1, size = 20 } = req.query;
-    
-    let query = `SELECT * FROM parts WHERE 1=1`;
-    const params = [];
-    let paramCount = 0;
-    
-    if (search) {
-      paramCount++;
-      query += ` AND (name ILIKE $${paramCount} OR sku ILIKE $${paramCount} OR description ILIKE $${paramCount})`;
-      params.push(`%${search}%`);
-    }
-    if (lowStock) {
-      paramCount++;
-      query += ` AND quantity_on_hand <= reorder_level`;
-      params.push(true);
-    }
-    
-    const countResult = await pool.query(`SELECT COUNT(*) as total FROM (${query}) as subquery`, params);
-    const total = parseInt(countResult.rows[0].total);
-    
-    const pageNum = parseInt(page);
-    const pageSize = parseInt(size);
-    const offset = (pageNum - 1) * pageSize;
-    
-    query += ` ORDER BY name LIMIT $${++paramCount} OFFSET $${++paramCount}`;
-    params.push(pageSize, offset);
-    
-    const result = await pool.query(query, params);
-    
+
+    let q = supabase.from('parts').select('*', { count: 'exact' });
+    if (search)          q = q.or(`name.ilike.%${search}%,sku.ilike.%${search}%,description.ilike.%${search}%`);
+    if (lowStock === 'true') q = q.lte('quantity_on_hand', supabase.raw('reorder_level'));
+    q = q.order('name');
+
+    const p    = Math.max(parseInt(page) || 1, 1);
+    const s    = Math.max(parseInt(size) || 20, 1);
+    const from = (p - 1) * s;
+    const { data, error, count } = await q.range(from, from + s - 1);
+    if (error) throw error;
+
+    const total = count || 0;
     res.json({
-      content: result.rows,
-      page: pageNum,
-      size: pageSize,
-      totalElements: total,
-      totalPages: Math.ceil(total / pageSize),
-      first: pageNum === 1,
-      last: pageNum * pageSize >= total,
+      content: data, page: p, size: s, totalElements: total,
+      totalPages: Math.ceil(total / s), first: p === 1, last: p * s >= total,
     });
   } catch (err) {
     console.error('Get parts error:', err.message);
@@ -619,126 +449,92 @@ app.get('/api/parts', async (req, res) => {
   }
 });
 
-// ============ DASHBOARD ROUTES ============
+// ══════════════════════════════════════════
+//  DASHBOARD
+// ══════════════════════════════════════════
 
-// Dashboard metrics
 app.get('/api/dashboard/metrics', async (req, res) => {
   try {
-    const woCount = await pool.query('SELECT COUNT(*) as count FROM work_orders');
-    const woStatusCounts = await pool.query(`SELECT status, COUNT(*) as count FROM work_orders GROUP BY status`);
-    const partsLow = await pool.query(`SELECT COUNT(*) as count FROM parts WHERE quantity_on_hand <= reorder_level`);
-    const users = await pool.query(`SELECT COUNT(*) as count FROM users WHERE role = 'TECHNICIAN'`);
-    const customers = await pool.query(`SELECT COUNT(*) as count FROM users WHERE role = 'CUSTOMER'`);
-    
-    const metrics = {
-      totalWorkOrders: parseInt(woCount.rows[0].count),
-      byStatus: {},
-      openWorkOrders: 0,
-      overdueWorkOrders: 0,
-      slaBreached: 0,
-      slaComplianceRate: 100,
-      openUrgent: 0,
-      openHigh: 0,
-      openMedium: 0,
-      openLow: 0,
-      totalTechnicians: parseInt(users.rows[0].count),
-      busyTechnicians: 0,
-      idleTechnicians: 0,
-      lowStockParts: parseInt(partsLow.rows[0].count),
-      lowStockAlerts: 0,
-      unreadDispatcherNotifications: 0,
-      averageCompletionHours: 0,
-      completedLast30Days: 0,
-      recentActivity: [],
-      priorityOrder: ['LOW', 'MEDIUM', 'HIGH', 'URGENT'],
-      statusOrder: ['NEW', 'ASSIGNED', 'IN_PROGRESS', 'ON_HOLD', 'COMPLETED', 'CLOSED'],
-      technicians: [],
-      completedLast30Days: 0,
-    };
-    
-    woStatusCounts.rows.forEach(row => {
-      const status = row.status;
-      metrics.byStatus[status] = parseInt(row.count);
-      if (status !== 'COMPLETED' && status !== 'CLOSED') {
-        metrics.openWorkOrders += parseInt(row.count);
+    const [
+      { data: allWo,       error: e1 },
+      { data: technicans,  error: e2 },
+      { data: lowParts,    error: e3 },
+    ] = await Promise.all([
+      supabase.from('work_orders').select('status, priority'),
+      supabase.from('users').select('id').eq('role', 'TECHNICIAN'),
+      supabase.from('parts').select('id').filter('quantity_on_hand', 'lte', 'reorder_level'),
+    ]);
+
+    if (e1 || e2 || e3) throw e1 || e2 || e3;
+
+    const byStatus = {};
+    let openWorkOrders = 0;
+    const openBy = { URGENT: 0, HIGH: 0, MEDIUM: 0, LOW: 0 };
+
+    (allWo || []).forEach(wo => {
+      byStatus[wo.status] = (byStatus[wo.status] || 0) + 1;
+      if (!['COMPLETED', 'CLOSED'].includes(wo.status)) {
+        openWorkOrders++;
+        if (openBy[wo.priority] !== undefined) openBy[wo.priority]++;
       }
-      if (['URGENT', 'HIGH'].includes(status)) {
-        if (status === 'URGENT') metrics.openUrgent += parseInt(row.count);
-        if (status === 'HIGH') metrics.openHigh += parseInt(row.count);
-      }
-      if (status === 'MEDIUM') metrics.openMedium += parseInt(row.count);
-      if (status === 'LOW') metrics.openLow += parseInt(row.count);
     });
-    
-    metrics.lowStockAlerts = Math.floor(metrics.lowStockParts * 0.3);
-    
-    res.json(metrics);
-  } catch (err) {
-    console.error('Get dashboard metrics error:', err.message);
+
     res.json({
-      totalWorkOrders: 0,
-      byStatus: {},
-      openWorkOrders: 0,
-      overdueWorkOrders: 0,
-      slaBreached: 0,
-      slaComplianceRate: 100,
-      openUrgent: 0,
-      openHigh: 0,
-      openMedium: 0,
-      openLow: 0,
-      totalTechnicians: 0,
-      busyTechnicians: 0,
-      idleTechnicians: 0,
-      lowStockParts: 0,
-      lowStockAlerts: 0,
+      totalWorkOrders:    allWo?.length || 0,
+      byStatus,
+      openWorkOrders,
+      overdueWorkOrders:  0,
+      slaBreached:        0,
+      slaComplianceRate:  100,
+      openUrgent:         openBy.URGENT,
+      openHigh:           openBy.HIGH,
+      openMedium:         openBy.MEDIUM,
+      openLow:            openBy.LOW,
+      totalTechnicians:   technicans?.length || 0,
+      busyTechnicians:    0,
+      idleTechnicians:    technicans?.length || 0,
+      lowStockParts:      lowParts?.length || 0,
+      lowStockAlerts:     lowParts?.length || 0,
       unreadDispatcherNotifications: 0,
       averageCompletionHours: 0,
-      completedLast30Days: 0,
-      recentActivity: [],
+      completedLast30Days:    byStatus['COMPLETED'] || 0,
+      recentActivity:         [],
       priorityOrder: ['LOW', 'MEDIUM', 'HIGH', 'URGENT'],
-      statusOrder: ['NEW', 'ASSIGNED', 'IN_PROGRESS', 'ON_HOLD', 'COMPLETED', 'CLOSED'],
-      technicians: [],
+      statusOrder:   ['NEW', 'ASSIGNED', 'IN_PROGRESS', 'ON_HOLD', 'COMPLETED', 'CLOSED'],
+      technicians:   [],
     });
+  } catch (err) {
+    console.error('Dashboard metrics error:', err.message);
+    res.status(500).json({ message: 'Internal server error' });
   }
 });
 
-// ============ NOTIFICATION ROUTES ============
+// ══════════════════════════════════════════
+//  NOTIFICATIONS
+// ══════════════════════════════════════════
 
-// List notifications
 app.get('/api/notifications', async (req, res) => {
   try {
-    const { page = 1, size = 20, unreadOnly } = req.query;
-    
-    let query = `SELECT n.*, u.first_name, u.last_name FROM notifications n LEFT JOIN users u ON n.user_id = u.id WHERE 1=1`;
-    const params = [];
-    let paramCount = 0;
-    
-    if (unreadOnly === 'true') {
-      paramCount++;
-      query += ` AND n.is_read = $${paramCount}`;
-      params.push(true);
-    }
-    
-    const countResult = await pool.query(`SELECT COUNT(*) as total FROM (${query}) as subquery`, params);
-    const total = parseInt(countResult.rows[0].total);
-    
-    const pageNum = parseInt(page);
-    const pageSize = parseInt(size);
-    const offset = (pageNum - 1) * pageSize;
-    
-    query += ` ORDER BY n.created_at DESC LIMIT $${++paramCount} OFFSET $${++paramCount}`;
-    params.push(pageSize, offset);
-    
-    const result = await pool.query(query, params);
-    
+    const { page = 0, size = 20, unreadOnly } = req.query;
+    const userId = currentUserId(req);
+
+    let q = supabase.from('notifications').select('*', { count: 'exact' });
+    if (userId)              q = q.eq('user_id', userId);
+    if (unreadOnly === 'true') q = q.eq('is_read', false);
+    q = q.order('created_at', { ascending: false });
+
+    const p    = Math.max(parseInt(page) || 0, 0);
+    const s    = Math.max(parseInt(size) || 20, 1);
+    const from = p * s;
+    const { data, error, count } = await q.range(from, from + s - 1);
+    if (error) throw error;
+
+    const total = count || 0;
     res.json({
-      content: result.rows,
-      page: pageNum,
-      size: pageSize,
-      totalElements: total,
-      totalPages: Math.ceil(total / pageSize),
-      first: pageNum === 1,
-      last: pageNum * pageSize >= total,
+      content:       (data || []).map(toNotification),
+      page: p, size: s, totalElements: total,
+      totalPages:    Math.ceil(total / s),
+      first:         p === 0, last: (p + 1) * s >= total,
     });
   } catch (err) {
     console.error('Get notifications error:', err.message);
@@ -746,43 +542,88 @@ app.get('/api/notifications', async (req, res) => {
   }
 });
 
-// Mark notification as read
-app.patch('/api/notifications/:id/read', async (req, res) => {
+app.get('/api/notifications/unread-count', async (req, res) => {
   try {
-    const { id } = req.params;
-    await pool.query('UPDATE notifications SET is_read = TRUE WHERE id = $1', [id]);
-    res.json({ message: 'Notification marked as read' });
+    const userId = currentUserId(req);
+    let q = supabase.from('notifications').select('*', { count: 'exact', head: true }).eq('is_read', false);
+    if (userId) q = q.eq('user_id', userId);
+    const { count, error } = await q;
+    if (error) throw error;
+    res.json(count || 0);
   } catch (err) {
-    console.error('Mark notification read error:', err.message);
+    console.error('Unread count error:', err.message);
     res.status(500).json({ message: 'Internal server error' });
   }
 });
 
-// Mark all notifications as read
-app.patch('/api/notifications/read-all', async (req, res) => {
+app.post('/api/notifications/:id/read', async (req, res) => {
   try {
-    await pool.query('UPDATE notifications SET is_read = TRUE WHERE is_read = FALSE');
+    const userId = currentUserId(req);
+    let q = supabase.from('notifications').update({ is_read: true }).eq('id', req.params.id);
+    if (userId) q = q.eq('user_id', userId);
+    const { data, error } = await q.select().single();
+    if (error) throw error;
+    if (!data) return res.status(404).json({ message: 'Notification not found' });
+    res.json(toNotification(data));
+  } catch (err) {
+    console.error('Mark read error:', err.message);
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+app.post('/api/notifications/read-all', async (req, res) => {
+  try {
+    const userId = currentUserId(req);
+    let q = supabase.from('notifications').update({ is_read: true }).eq('is_read', false);
+    if (userId) q = q.eq('user_id', userId);
+    const { error } = await q;
+    if (error) throw error;
     res.json({ message: 'All notifications marked as read' });
   } catch (err) {
-    console.error('Mark all notifications read error:', err.message);
+    console.error('Mark all read error:', err.message);
     res.status(500).json({ message: 'Internal server error' });
   }
 });
 
-// ============ SCHEDULE/HEALTH ============
+// ══════════════════════════════════════════
+//  USERS
+// ══════════════════════════════════════════
 
-// Health check - Vercel serverless needs this export
-app.get('/health', (req, res) => {
-  res.json({ status: 'OK' });
+app.get('/api/users', async (req, res) => {
+  try {
+    const { role, page = 1, size = 20 } = req.query;
+    let q = supabase.from('users').select('id, username, first_name, last_name, email, phone, role, enabled, created_at', { count: 'exact' });
+    if (role) q = q.eq('role', role);
+    q = q.order('username');
+
+    const p    = Math.max(parseInt(page) || 1, 1);
+    const s    = Math.max(parseInt(size) || 20, 1);
+    const from = (p - 1) * s;
+    const { data, error, count } = await q.range(from, from + s - 1);
+    if (error) throw error;
+
+    const total = count || 0;
+    res.json({
+      content: data, page: p, size: s, totalElements: total,
+      totalPages: Math.ceil(total / s), first: p === 1, last: p * s >= total,
+    });
+  } catch (err) {
+    console.error('Get users error:', err.message);
+    res.status(500).json({ message: 'Internal server error' });
+  }
 });
 
-// Start server (for local development - Vercel serverless will use module.exports)
-if (require.main === module) {
-  app.listen(PORT, () => {
-    console.log(`Keystone API running on port ${PORT}`);
-    console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
-  });
-}
+// ══════════════════════════════════════════
+//  HEALTH
+// ══════════════════════════════════════════
 
-// For Vercel serverless deployment: export the app
-module.exports = app;
+app.get('/actuator/health', (req, res) => res.json({ status: 'UP', timestamp: new Date().toISOString() }));
+app.get('/health',          (req, res) => res.json({ status: 'OK' }));
+
+// ── Start ──
+app.listen(PORT, () => {
+  console.log(`Keystone API running on port ${PORT}`);
+  console.log(`Supabase: ${process.env.SUPABASE_URL}`);
+});
+
+process.on('SIGTERM', () => { console.log('Shutting down...'); process.exit(0); });
