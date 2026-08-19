@@ -1,15 +1,15 @@
-# syntax=docker/dockerfile:1
 FROM maven:3.9.9-eclipse-temurin-21 AS build
-WORKDIR /build
-COPY pom.xml .
-RUN mvn -q dependency:go-offline
-COPY src ./src
-RUN mvn -q -DskipTests package
-
-FROM eclipse-temurin:21-jre-alpine
-RUN addgroup -S keystone && adduser -S keystone -G keystone
 WORKDIR /app
-COPY --from=build /build/target/fieldservice-1.0.0.jar app.jar
-USER keystone
+COPY backend/pom.xml backend/pom.xml
+COPY backend/.mvn backend/.mvn
+COPY backend/mvnw backend/mvnw
+WORKDIR /app/backend
+RUN mvn dependency:go-offline -B
+COPY backend/src src
+RUN mvn -DskipTests package -B
+
+FROM eclipse-temurin:21-jre-jammy
+WORKDIR /app
+COPY --from=build /app/backend/target/fieldservice-1.0.0.jar app.jar
 EXPOSE 8080
-ENTRYPOINT ["java", "-XX:MaxRAMPercentage=75", "-jar", "app.jar"]
+ENTRYPOINT ["java", "-jar", "app.jar"]
