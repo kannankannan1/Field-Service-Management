@@ -21,7 +21,7 @@ export function connectWebSocket(): void {
   if (client || !getToken()) {
     return;
   }
-  const backendUrl = import.meta.env.VITE_API_URL || '';
+  const backendUrl = '';
   const wsUrl = backendUrl ? backendUrl + '/ws' : '/ws';
   const sock = new SockJS(wsUrl);
   client = new Client({

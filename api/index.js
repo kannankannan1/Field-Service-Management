@@ -26,6 +26,9 @@ app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors({ origin: CORS_ALLOWED.length ? CORS_ALLOWED : true, credentials: true }));
 app.use(express.json());
 
+// Vercel strips nothing — the full path arrives e.g. /api/auth/register
+// So all routes are registered with /api prefix which is correct.
+
 // ── Helpers ──
 function makeAccessToken(user) {
   return jwt.sign(
