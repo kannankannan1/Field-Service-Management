@@ -1,0 +1,61 @@
+name: keystone
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: keystone-postgres
+    environment:
+      POSTGRES_DB: keystone
+      POSTGRES_USER: keystone
+      POSTGRES_PASSWORD: keystone
+    ports:
+      - "5432:5432"
+    volumes:
+      - keystone_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U keystone -d keystone"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build: ./backend
+    container_name: keystone-backend
+    environment:
+      SPRING_PROFILES_ACTIVE: docker
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_NAME: keystone
+      DB_USERNAME: keystone
+      DB_PASSWORD: keystone
+      JWT_SECRET: ${JWT_SECRET:-change-this-to-a-long-random-secret-of-at-least-64-chars}
+      JWT_EXPIRATION_MS: "86400000"
+      CORS_ALLOWED_ORIGINS: http://localhost:8081
+      SLA_URGENT_HOURS: "4"
+      SLA_HIGH_HOURS: "24"
+      SLA_MEDIUM_HOURS: "72"
+      SLA_LOW_HOURS: "120"
+      SLA_SCHEDULER_ENABLED: "true"
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/actuator/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  frontend:
+    build: ./frontend
+    container_name: keystone-frontend
+    ports:
+      - "8081:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+
+volumes:
+  keystone_pgdata:
