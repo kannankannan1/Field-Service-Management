@@ -5,8 +5,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "dev": "node --watch index.js",
-    "build": "echo 'Build complete'"
+    "dev": "node --watch index.js"
   },
   "engines": {
     "node": ">=20"
@@ -19,9 +18,5 @@
     "express": "^5.1.0",
     "helmet": "^8.0.0",
     "jsonwebtoken": "^9.0.2"
-  },
-  "optionalDependencies": {
-    "better-sqlite3": "^13.0.3",
-    "@vercel/postgres": "^0.10.0"
   }
 }
